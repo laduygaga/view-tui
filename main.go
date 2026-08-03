@@ -665,13 +665,17 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	switch msg.String() {
+	keyStr := msg.String()
+	if msg.Type == tea.KeyRunes && strings.HasPrefix(keyStr, "/") {
+		m.filePickerSearching = true
+		m.filePickerSearchQuery = keyStr[1:]
+		m.filterFiles()
+		return m, nil
+	}
+
+	switch keyStr {
 	case "q", "ctrl+c":
 		return m, tea.Quit
-
-	case "/":
-		m.filePickerSearching = true
-		return m, nil
 
 	case "up", "k":
 		if len(m.filteredFiles) > 0 {
@@ -721,6 +725,13 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	keyStr := msg.String()
+	if msg.Type == tea.KeyRunes && strings.HasPrefix(keyStr, "/") {
+		m.searching = true
+		m.searchQuery = keyStr[1:]
+		m.updateSearchMatches()
+		m.viewport.SetContent(m.getProcessedChapterContent())
+		return m, nil
+	}
 
 	// Handle 'gg' sequence
 	if m.lastKey == "g" && keyStr == "g" {
