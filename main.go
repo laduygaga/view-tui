@@ -327,11 +327,11 @@ func loadFiles() tea.Cmd {
 			".rbenv", "rbenv", ".rustup", ".vscode", ".wine", ".wine32", ".wine64",
 		}
 
-		args := []string{"-t", "f", "-H", "-e", "pdf", "-e", "epub"}
+		args := []string{".", "--base-directory", home, "-t", "f", "-H", "-e", "pdf", "-e", "epub"}
 		for _, ex := range excludes {
 			args = append(args, "-E", ex)
 		}
-		args = append(args, "--color", "never", home)
+		args = append(args, "--color", "never")
 
 		cmd := exec.Command("fd", args...)
 		output, err := cmd.Output()
@@ -351,14 +351,19 @@ func loadFiles() tea.Cmd {
 				continue
 			}
 
-			info, err := os.Stat(path)
+			fullPath := path
+			if !filepath.IsAbs(path) {
+				fullPath = filepath.Join(home, path)
+			}
+
+			info, err := os.Stat(fullPath)
 			if err != nil {
 				continue
 			}
 
 			files = append(files, fileEntry{
-				name:     filepath.Base(path),
-				fullPath: path,
+				name:     path,
+				fullPath: fullPath,
 				size:     info.Size(),
 			})
 		}
@@ -588,7 +593,7 @@ func (m *model) scrollToMatch() {
 }
 
 func (m model) Init() tea.Cmd {
-	if len(m.files) == 0 && m.mode == modeFilePicker && !m.loading {
+	if m.mode == modeFilePicker && len(m.files) == 0 {
 		return loadFiles()
 	}
 	return nil
