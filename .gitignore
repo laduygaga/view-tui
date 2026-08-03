@@ -1,0 +1,4 @@
+view-tui
+test-bin
+*.test
+.omo/
