@@ -639,71 +639,79 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.filePickerSearching {
-		switch msg.Type {
-		case tea.KeyEnter:
-			m.filePickerSearching = false
-			return m, nil
-		case tea.KeyEsc, tea.KeyCtrlC:
-			m.filePickerSearching = false
-			m.filePickerSearchQuery = ""
-			m.filterFiles()
-			return m, nil
-		case tea.KeyBackspace:
-			if len(m.filePickerSearchQuery) > 0 {
-				m.filePickerSearchQuery = m.filePickerSearchQuery[:len(m.filePickerSearchQuery)-1]
-				m.filterFiles()
+	keyStr := msg.String()
+
+	switch msg.Type {
+	case tea.KeyEnter:
+		if len(m.filteredFiles) > 0 {
+			selected := m.filteredFiles[m.fileIndex]
+			filePath := selected.fullPath
+			err := m.loadBook(filePath)
+			if err != nil {
+				m.errorMessage = err.Error()
+			} else {
+				m.errorMessage = ""
 			}
-			return m, nil
-		case tea.KeyRunes, tea.KeySpace:
-			m.filePickerSearchQuery += string(msg.Runes)
-			m.filterFiles()
-			return m, nil
 		}
 		return m, nil
-	}
 
-	keyStr := msg.String()
-	if msg.Type == tea.KeyRunes && strings.HasPrefix(keyStr, "/") {
-		m.filePickerSearching = true
-		m.filePickerSearchQuery = keyStr[1:]
+	case tea.KeyEsc:
+		m.filePickerSearchQuery = ""
+		m.filterFiles()
+		return m, nil
+
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+
+	case tea.KeyBackspace:
+		if len(m.filePickerSearchQuery) > 0 {
+			m.filePickerSearchQuery = m.filePickerSearchQuery[:len(m.filePickerSearchQuery)-1]
+			m.filterFiles()
+		}
+		return m, nil
+
+	case tea.KeyUp, tea.KeyDown:
+		if msg.Type == tea.KeyUp {
+			if len(m.filteredFiles) > 0 {
+				m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
+			}
+		} else {
+			if len(m.filteredFiles) > 0 {
+				m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
+			}
+		}
+		return m, nil
+
+	case tea.KeyRunes, tea.KeySpace:
+		if keyStr == "j" || keyStr == "k" {
+			if keyStr == "k" {
+				if len(m.filteredFiles) > 0 {
+					m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
+				}
+			} else {
+				if len(m.filteredFiles) > 0 {
+					m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
+				}
+			}
+			return m, nil
+		}
+
+		if keyStr == "q" && m.filePickerSearchQuery == "" {
+			return m, tea.Quit
+		}
+		
+		if keyStr == "r" && m.filePickerSearchQuery == "" {
+			m.loading = true
+			m.files = nil
+			m.filteredFiles = nil
+			return m, loadFiles()
+		}
+
+		m.filePickerSearchQuery += keyStr
 		m.filterFiles()
 		return m, nil
 	}
 
-	switch keyStr {
-	case "q", "ctrl+c":
-		return m, tea.Quit
-
-	case "r":
-		m.loading = true
-		m.files = nil
-		m.filteredFiles = nil
-		return m, loadFiles()
-
-	case "up", "k":
-		if len(m.filteredFiles) > 0 {
-			m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
-		}
-
-	case "down", "j":
-		if len(m.filteredFiles) > 0 {
-			m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
-		}
-
-	case "right", "l", "enter":
-		if len(m.filteredFiles) == 0 {
-			break
-		}
-		selected := m.filteredFiles[m.fileIndex]
-		filePath := selected.fullPath
-		err := m.loadBook(filePath)
-		if err != nil {
-			m.errorMessage = err.Error()
-		} else {
-			m.errorMessage = ""
-		}
-	}
 	return m, nil
 }
 
@@ -854,19 +862,20 @@ func (m model) viewFilePicker() string {
 	s.WriteString(styleFilePickerHeader.Render("🔍 TUI E-Reader - Search Books"))
 	s.WriteString("\n\n")
 
+	// Search bar at the top (FZF style)
+	s.WriteString(fmt.Sprintf("  Search: %s█\n\n", m.filePickerSearchQuery))
+
 	if m.loading {
 		s.WriteString("  Searching for books with 'fd'...\n\n")
-	} else {
-		s.WriteString(fmt.Sprintf("  Found %d books in $HOME\n\n", len(m.files)))
-	}
-
-	if m.errorMessage != "" {
+	} else if m.errorMessage != "" {
 		s.WriteString(styleError.Render(fmt.Sprintf("Error: %s", m.errorMessage)))
 		s.WriteString("\n\n")
+	} else {
+		s.WriteString(fmt.Sprintf("  Found %d books in $HOME\n\n", len(m.filteredFiles)))
 	}
 
 	if !m.loading && len(m.filteredFiles) == 0 {
-		s.WriteString("  (No EPUB or PDF files found)\n")
+		s.WriteString("  (No matches found)\n")
 	} else {
 		for i, file := range m.filteredFiles {
 			prefix := "  "
@@ -892,20 +901,12 @@ func (m model) viewFilePicker() string {
 	}
 
 	linesCount := strings.Count(s.String(), "\n")
-	neededNewlines := m.height - linesCount - 4
+	neededNewlines := m.height - linesCount - 2
 	for i := 0; i < neededNewlines; i++ {
 		s.WriteString("\n")
 	}
 
-	if m.filePickerSearching {
-		s.WriteString(fmt.Sprintf("Search: /%s█\n", m.filePickerSearchQuery))
-	} else if m.filePickerSearchQuery != "" {
-		s.WriteString(fmt.Sprintf("Search: /%s (Esc to clear)\n", m.filePickerSearchQuery))
-	} else {
-		s.WriteString("\n")
-	}
-
-	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Filter  •  r: Refresh  •  q: Exit"))
+	s.WriteString(styleFooter.Render("j/k: Navigate  •  Enter: Open  •  r: Refresh  •  Esc: Clear Search  •  q: Exit"))
 	return s.String()
 }
 
