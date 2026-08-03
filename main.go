@@ -869,9 +869,31 @@ func (m model) viewFilePicker() string {
 	if !m.loading && len(m.filteredFiles) == 0 {
 		s.WriteString("  (No matches found)\n")
 	} else {
-		for i, file := range m.filteredFiles {
+		maxItems := m.height - 10
+		if maxItems < 1 {
+			maxItems = 1
+		}
+		start := 0
+		end := len(m.filteredFiles)
+		if len(m.filteredFiles) > maxItems {
+			start = m.fileIndex - maxItems/2
+			if start < 0 {
+				start = 0
+			}
+			end = start + maxItems
+			if end > len(m.filteredFiles) {
+				end = len(m.filteredFiles)
+				start = end - maxItems
+				if start < 0 {
+					start = 0
+				}
+			}
+		}
+
+		for idx := start; idx < end; idx++ {
+			file := m.filteredFiles[idx]
 			prefix := "  "
-			if i == m.fileIndex {
+			if idx == m.fileIndex {
 				prefix = "> "
 			}
 
@@ -883,7 +905,7 @@ func (m model) viewFilePicker() string {
 			}
 
 			line := fmt.Sprintf("%s%s%s", prefix, icon, file.name)
-			if i == m.fileIndex {
+			if idx == m.fileIndex {
 				s.WriteString(styleFilePickerSelected.Render(line))
 			} else {
 				s.WriteString(line)
