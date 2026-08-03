@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -115,8 +116,8 @@ type model struct {
 	searchMatches       []int
 	searchActiveIndex   int
 
-	filePickerSearching    bool
-	filePickerSearchQuery  string
+	filePickerInput     textinput.Model
+	readerSearchInput   textinput.Model
 
 	showHelp            bool
 	lastKey             string
@@ -372,13 +373,14 @@ func loadFiles() tea.Cmd {
 }
 
 func (m *model) filterFiles() {
-	if m.filePickerSearchQuery == "" {
+	query := m.filePickerInput.Value()
+	if query == "" {
 		m.filteredFiles = m.files
 	} else {
 		m.filteredFiles = nil
-		query := strings.ToLower(m.filePickerSearchQuery)
+		lowerQuery := strings.ToLower(query)
 		for _, f := range m.files {
-			if strings.Contains(strings.ToLower(f.name), query) || strings.Contains(strings.ToLower(f.fullPath), query) {
+			if strings.Contains(strings.ToLower(f.name), lowerQuery) || strings.Contains(strings.ToLower(f.fullPath), lowerQuery) {
 				m.filteredFiles = append(m.filteredFiles, f)
 			}
 		}
@@ -639,8 +641,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	keyStr := msg.String()
-
 	switch msg.Type {
 	case tea.KeyEnter:
 		if len(m.filteredFiles) > 0 {
@@ -656,8 +656,8 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEsc:
-		if m.filePickerSearchQuery != "" {
-			m.filePickerSearchQuery = ""
+		if m.filePickerInput.Value() != "" {
+			m.filePickerInput.SetValue("")
 			m.filterFiles()
 		} else {
 			return m, tea.Quit
@@ -667,44 +667,23 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
 
-	case tea.KeyBackspace:
-		if len(m.filePickerSearchQuery) > 0 {
-			m.filePickerSearchQuery = m.filePickerSearchQuery[:len(m.filePickerSearchQuery)-1]
-			m.filterFiles()
-		}
-		return m, nil
-
-	case tea.KeyCtrlJ:
+	case tea.KeyCtrlJ, tea.KeyDown, tea.KeyCtrlN:
 		if len(m.filteredFiles) > 0 {
 			m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
 		}
 		return m, nil
 
-	case tea.KeyCtrlK:
+	case tea.KeyCtrlK, tea.KeyUp, tea.KeyCtrlP:
 		if len(m.filteredFiles) > 0 {
 			m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
 		}
 		return m, nil
-
-	case tea.KeyUp, tea.KeyDown:
-		if msg.Type == tea.KeyUp {
-			if len(m.filteredFiles) > 0 {
-				m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
-			}
-		} else {
-			if len(m.filteredFiles) > 0 {
-				m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
-			}
-		}
-		return m, nil
-
-	case tea.KeyRunes, tea.KeySpace:
-		m.filePickerSearchQuery += keyStr
-		m.filterFiles()
-		return m, nil
 	}
 
-	return m, nil
+	var cmd tea.Cmd
+	m.filePickerInput, cmd = m.filePickerInput.Update(msg)
+	m.filterFiles()
+	return m, cmd
 }
 
 func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -715,7 +694,9 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	keyStr := msg.String()
 	if msg.Type == tea.KeyRunes && strings.HasPrefix(keyStr, "/") {
 		m.searching = true
-		m.searchQuery = keyStr[1:]
+		m.readerSearchInput.SetValue(keyStr[1:])
+		m.readerSearchInput.Focus()
+		m.searchQuery = m.readerSearchInput.Value()
 		m.updateSearchMatches()
 		m.viewport.SetContent(m.getProcessedChapterContent())
 		return m, nil
@@ -787,14 +768,14 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport.GotoTop()
 		}
 
-	case "n":
+	case "n", "ctrl+n":
 		if len(m.searchMatches) > 0 {
 			m.searchActiveIndex = (m.searchActiveIndex + 1) % len(m.searchMatches)
 			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
 		}
 
-	case "N":
+	case "N", "ctrl+p":
 		if len(m.searchMatches) > 0 {
 			m.searchActiveIndex = (m.searchActiveIndex - 1 + len(m.searchMatches)) % len(m.searchMatches)
 			m.scrollToMatch()
@@ -811,27 +792,42 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searching = false
 		m.updateSearchMatches()
 		m.viewport.SetContent(m.getProcessedChapterContent())
+		return m, nil
 
 	case tea.KeyEsc, tea.KeyCtrlC:
 		m.searching = false
+		m.readerSearchInput.SetValue("")
 		m.searchQuery = ""
 		m.searchMatches = nil
 		m.searchActiveIndex = -1
 		m.viewport.SetContent(m.getProcessedChapterContent())
+		return m, nil
 
-	case tea.KeyBackspace:
-		if len(m.searchQuery) > 0 {
-			m.searchQuery = m.searchQuery[:len(m.searchQuery)-1]
-			m.updateSearchMatches()
+	case tea.KeyCtrlN:
+		m.updateSearchMatches()
+		if len(m.searchMatches) > 0 {
+			m.searchActiveIndex = (m.searchActiveIndex + 1) % len(m.searchMatches)
+			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
 		}
+		return m, nil
 
-	case tea.KeyRunes, tea.KeySpace:
-		m.searchQuery += string(msg.Runes)
+	case tea.KeyCtrlP:
 		m.updateSearchMatches()
-		m.viewport.SetContent(m.getProcessedChapterContent())
+		if len(m.searchMatches) > 0 {
+			m.searchActiveIndex = (m.searchActiveIndex - 1 + len(m.searchMatches)) % len(m.searchMatches)
+			m.scrollToMatch()
+			m.viewport.SetContent(m.getProcessedChapterContent())
+		}
+		return m, nil
 	}
-	return m, nil
+
+	var cmd tea.Cmd
+	m.readerSearchInput, cmd = m.readerSearchInput.Update(msg)
+	m.searchQuery = m.readerSearchInput.Value()
+	m.updateSearchMatches()
+	m.viewport.SetContent(m.getProcessedChapterContent())
+	return m, cmd
 }
 
 func (m model) View() string {
@@ -855,7 +851,7 @@ func (m model) viewFilePicker() string {
 	s.WriteString("\n\n")
 
 	// Search bar at the top (FZF style)
-	s.WriteString(fmt.Sprintf("  Search: %s█\n\n", m.filePickerSearchQuery))
+	s.WriteString(fmt.Sprintf("  Search: %s\n\n", m.filePickerInput.View()))
 
 	if m.loading {
 		s.WriteString("  Searching for books with 'fd'...\n\n")
@@ -943,7 +939,7 @@ func (m model) viewReader() string {
 	s.WriteString("\n\n")
 
 	if m.searching {
-		s.WriteString(fmt.Sprintf("/%s█", m.searchQuery))
+		s.WriteString(fmt.Sprintf("/%s", m.readerSearchInput.View()))
 	} else {
 		pct := 0
 		if len(m.chapters) > 0 {
@@ -1018,6 +1014,15 @@ func formatBytes(b int64) string {
 func main() {
 	var initialModel model
 	initialModel.loading = true
+
+	initialModel.filePickerInput = textinput.New()
+	initialModel.filePickerInput.Placeholder = ""
+	initialModel.filePickerInput.Focus()
+	initialModel.filePickerInput.Prompt = ""
+
+	initialModel.readerSearchInput = textinput.New()
+	initialModel.readerSearchInput.Placeholder = ""
+	initialModel.readerSearchInput.Prompt = ""
 
 	if len(os.Args) > 1 {
 		filePath := os.Args[1]
