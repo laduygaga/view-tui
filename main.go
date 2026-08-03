@@ -107,6 +107,7 @@ type model struct {
 	mode                appMode
 	currentPath         string
 	files               []fileEntry
+	filteredFiles       []fileEntry
 	fileIndex           int
 	errorMessage        string
 	cliMode             bool // true if path was passed as argument
@@ -122,6 +123,9 @@ type model struct {
 	searchQuery         string
 	searchMatches       []int
 	searchActiveIndex   int
+
+	filePickerSearching    bool
+	filePickerSearchQuery  string
 
 	showHelp            bool
 	lastKey             string
@@ -366,12 +370,32 @@ func (m *model) refreshFiles() error {
 		}
 	}
 
-	m.fileIndex = 0
-	if len(m.files) > 1 && m.files[0].name == ".." {
-		m.fileIndex = 1
-	}
+	m.filePickerSearchQuery = ""
+	m.filePickerSearching = false
+	m.filterFiles()
 
 	return nil
+}
+
+func (m *model) filterFiles() {
+	if m.filePickerSearchQuery == "" {
+		m.filteredFiles = m.files
+	} else {
+		m.filteredFiles = nil
+		query := strings.ToLower(m.filePickerSearchQuery)
+		for _, f := range m.files {
+			if f.name == ".." || strings.Contains(strings.ToLower(f.name), query) {
+				m.filteredFiles = append(m.filteredFiles, f)
+			}
+		}
+	}
+
+	m.fileIndex = 0
+	if len(m.filteredFiles) > 1 && m.filteredFiles[0].name == ".." {
+		m.fileIndex = 1
+	} else if len(m.filteredFiles) == 0 {
+		m.fileIndex = 0
+	}
 }
 
 // loadBook loads a book by filepath and sets reader mode
@@ -617,18 +641,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.filePickerSearching {
+		switch msg.Type {
+		case tea.KeyEnter:
+			m.filePickerSearching = false
+			return m, nil
+		case tea.KeyEsc, tea.KeyCtrlC:
+			m.filePickerSearching = false
+			m.filePickerSearchQuery = ""
+			m.filterFiles()
+			return m, nil
+		case tea.KeyBackspace:
+			if len(m.filePickerSearchQuery) > 0 {
+				m.filePickerSearchQuery = m.filePickerSearchQuery[:len(m.filePickerSearchQuery)-1]
+				m.filterFiles()
+			}
+			return m, nil
+		case tea.KeyRunes, tea.KeySpace:
+			m.filePickerSearchQuery += string(msg.Runes)
+			m.filterFiles()
+			return m, nil
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
+	case "/":
+		m.filePickerSearching = true
+		return m, nil
+
 	case "up", "k":
-		if len(m.files) > 0 {
-			m.fileIndex = (m.fileIndex - 1 + len(m.files)) % len(m.files)
+		if len(m.filteredFiles) > 0 {
+			m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
 		}
 
 	case "down", "j":
-		if len(m.files) > 0 {
-			m.fileIndex = (m.fileIndex + 1) % len(m.files)
+		if len(m.filteredFiles) > 0 {
+			m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
 		}
 
 	case "left", "h":
@@ -639,10 +691,10 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "right", "l", "enter":
-		if len(m.files) == 0 {
+		if len(m.filteredFiles) == 0 {
 			break
 		}
-		selected := m.files[m.fileIndex]
+		selected := m.filteredFiles[m.fileIndex]
 		if selected.isDir {
 			if selected.name == ".." {
 				m.currentPath = filepath.Dir(m.currentPath)
@@ -820,10 +872,10 @@ func (m model) viewFilePicker() string {
 	}
 
 	// File List
-	if len(m.files) == 0 {
+	if len(m.filteredFiles) == 0 {
 		s.WriteString("  (No EPUB or PDF files found in this folder)\n")
 	} else {
-		for i, file := range m.files {
+		for i, file := range m.filteredFiles {
 			prefix := "  "
 			if i == m.fileIndex {
 				prefix = "> "
@@ -858,13 +910,21 @@ func (m model) viewFilePicker() string {
 
 	// Pad file picker to fill screen height
 	linesCount := strings.Count(s.String(), "\n")
-	neededNewlines := m.height - linesCount - 3
+	neededNewlines := m.height - linesCount - 4
 	for i := 0; i < neededNewlines; i++ {
 		s.WriteString("\n")
 	}
 
+	if m.filePickerSearching {
+		s.WriteString(fmt.Sprintf("Search: /%s█\n", m.filePickerSearchQuery))
+	} else if m.filePickerSearchQuery != "" {
+		s.WriteString(fmt.Sprintf("Search: /%s (Esc to clear)\n", m.filePickerSearchQuery))
+	} else {
+		s.WriteString("\n")
+	}
+
 	// Footer Keybindings
-	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  h: Back  •  q: Exit"))
+	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Search  •  h: Back  •  q: Exit"))
 	return s.String()
 }
 
