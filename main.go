@@ -17,20 +17,17 @@ import (
 	"golang.org/x/net/html"
 )
 
-// Chapter represents a chapter in EPUB or a page in PDF
 type Chapter struct {
 	Title string
 	Body  string
 }
 
-// BookMetadata contains information about the book
 type BookMetadata struct {
 	Title  string
 	Author string
 	Type   string // "epub" or "pdf"
 }
 
-// appMode defines the application screen
 type appMode int
 
 const (
@@ -38,15 +35,12 @@ const (
 	modeReader
 )
 
-// fileEntry represents an item in the directory list
 type fileEntry struct {
 	name     string
 	fullPath string
-	isDir    bool
 	size     int64
 }
 
-// Lip Gloss Styles
 var (
 	styleTitle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FAFAFA")).
@@ -87,10 +81,6 @@ var (
 				Background(lipgloss.Color("#F25D94")).
 				Bold(true)
 
-	styleFileDir = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#7D56F4")).
-			Bold(true)
-
 	styleHelpKey = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#2E5BFF")).
 			Bold(true)
@@ -104,14 +94,13 @@ var (
 			Padding(0, 1)
 )
 
-// Model represents the bubble tea application state
 type model struct {
 	mode                appMode
-	currentPath         string
 	files               []fileEntry
 	filteredFiles       []fileEntry
 	fileIndex           int
 	errorMessage        string
+	loading             bool
 	cliMode             bool // true if path was passed as argument
 
 	metadata            BookMetadata
@@ -128,13 +117,11 @@ type model struct {
 
 	filePickerSearching    bool
 	filePickerSearchQuery  string
-	globalSearching        bool
 
 	showHelp            bool
 	lastKey             string
 }
 
-// htmlToTextAndTitle extracts text content and title from an HTML reader
 func htmlToTextAndTitle(r io.Reader) (string, string) {
 	var bodyBuf bytes.Buffer
 	var title string
@@ -195,7 +182,6 @@ func htmlToTextAndTitle(r io.Reader) (string, string) {
 	}
 }
 
-// cleanText formats and normalizes whitespaces/HTML entities
 func cleanText(s string) string {
 	lines := strings.Split(s, "\n")
 	var cleaned []string
@@ -218,7 +204,6 @@ func cleanText(s string) string {
 	return strings.TrimSpace(strings.Join(cleaned, "\n"))
 }
 
-// readEpub parses an EPUB file and extracts readable chapters and metadata
 func readEpub(filePath string) ([]Chapter, BookMetadata, error) {
 	rc, err := epub.OpenReader(filePath)
 	if err != nil {
@@ -275,7 +260,6 @@ func readEpub(filePath string) ([]Chapter, BookMetadata, error) {
 	return chapters, meta, nil
 }
 
-// readPdf parses a PDF file and extracts readable pages
 func readPdf(filePath string) ([]Chapter, BookMetadata, error) {
 	r, err := pdf.Open(filePath)
 	if err != nil {
@@ -327,111 +311,59 @@ func readPdf(filePath string) ([]Chapter, BookMetadata, error) {
 	return chapters, meta, nil
 }
 
-// refreshFiles reads current directory contents and filters directory listing
-func (m *model) refreshFiles() error {
-	absPath, err := filepath.Abs(m.currentPath)
-	if err == nil {
-		m.currentPath = absPath
-	}
+type loadedFilesMsg []fileEntry
+type errMsg error
 
-	entries, err := os.ReadDir(m.currentPath)
-	if err != nil {
-		return err
-	}
-
-	m.files = nil
-
-	// Check if we can go up
-	parent := filepath.Dir(m.currentPath)
-	if parent != m.currentPath {
-		m.files = append(m.files, fileEntry{
-			name:  "..",
-			isDir: true,
-		})
-	}
-
-	for _, entry := range entries {
-		info, err := entry.Info()
+func loadFiles() tea.Cmd {
+	return func() tea.Msg {
+		home, err := os.UserHomeDir()
 		if err != nil {
-			continue
+			return errMsg(err)
 		}
 
-		name := entry.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
+		excludes := []string{
+			".git", "__pycache__", "node_modules", ".local", ".cache",
+			".cargo", ".npm", ".nvm", ".pyenv", ".venv", "venv",
+			".rbenv", "rbenv", ".rustup", ".vscode", ".wine", ".wine32", ".wine64",
 		}
 
-		isDir := entry.IsDir()
-		ext := strings.ToLower(filepath.Ext(name))
+		args := []string{"-t", "f", "-H", "-e", "pdf", "-e", "epub"}
+		for _, ex := range excludes {
+			args = append(args, "-E", ex)
+		}
+		args = append(args, "--color", "never", home)
 
-		if isDir || ext == ".pdf" || ext == ".epub" {
-			m.files = append(m.files, fileEntry{
-				name:     name,
-				fullPath: filepath.Join(m.currentPath, name),
-				isDir:    isDir,
+		cmd := exec.Command("fd", args...)
+		output, err := cmd.Output()
+		if err != nil {
+			// fd returns 1 if no files are found in some versions, but we should treat it as empty list if exit code is 1 and no other error
+			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+				return loadedFilesMsg([]fileEntry{})
+			}
+			return errMsg(fmt.Errorf("fd error: %v", err))
+		}
+
+		lines := strings.Split(string(output), "\n")
+		var files []fileEntry
+		for _, line := range lines {
+			path := strings.TrimSpace(line)
+			if path == "" {
+				continue
+			}
+
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+
+			files = append(files, fileEntry{
+				name:     filepath.Base(path),
+				fullPath: path,
 				size:     info.Size(),
 			})
 		}
+		return loadedFilesMsg(files)
 	}
-
-	m.filePickerSearchQuery = ""
-	m.filePickerSearching = false
-	m.globalSearching = false
-	m.filterFiles()
-
-	return nil
-}
-
-func (m *model) globalSearch() error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-
-	excludes := []string{
-		".git", "__pycache__", "node_modules", ".local", ".cache",
-		".cargo", ".npm", ".nvm", ".pyenv", ".venv", "venv",
-		".rbenv", "rbenv", ".rustup", ".vscode", ".wine", ".wine32", ".wine64",
-	}
-
-	args := []string{"-t", "f", "-H", "-e", "pdf", "-e", "epub"}
-	for _, ex := range excludes {
-		args = append(args, "-E", ex)
-	}
-	args = append(args, "--color", "never", home)
-
-	cmd := exec.Command("fd", args...)
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("fd error: %v (make sure 'fd' is installed)", err)
-	}
-
-	lines := strings.Split(string(output), "\n")
-	m.files = nil
-	for _, line := range lines {
-		path := strings.TrimSpace(line)
-		if path == "" {
-			continue
-		}
-
-		info, err := os.Stat(path)
-		if err != nil {
-			continue
-		}
-
-		m.files = append(m.files, fileEntry{
-			name:     filepath.Base(path),
-			fullPath: path,
-			isDir:    false,
-			size:     info.Size(),
-		})
-	}
-
-	m.globalSearching = true
-	m.filePickerSearchQuery = ""
-	m.filePickerSearching = false
-	m.filterFiles()
-	return nil
 }
 
 func (m *model) filterFiles() {
@@ -441,21 +373,17 @@ func (m *model) filterFiles() {
 		m.filteredFiles = nil
 		query := strings.ToLower(m.filePickerSearchQuery)
 		for _, f := range m.files {
-			if f.name == ".." || strings.Contains(strings.ToLower(f.name), query) {
+			if strings.Contains(strings.ToLower(f.name), query) || strings.Contains(strings.ToLower(f.fullPath), query) {
 				m.filteredFiles = append(m.filteredFiles, f)
 			}
 		}
 	}
 
-	m.fileIndex = 0
-	if len(m.filteredFiles) > 1 && m.filteredFiles[0].name == ".." {
-		m.fileIndex = 1
-	} else if len(m.filteredFiles) == 0 {
+	if m.fileIndex >= len(m.filteredFiles) {
 		m.fileIndex = 0
 	}
 }
 
-// loadBook loads a book by filepath and sets reader mode
 func (m *model) loadBook(filePath string) error {
 	var chapters []Chapter
 	var meta BookMetadata
@@ -484,7 +412,6 @@ func (m *model) loadBook(filePath string) error {
 	m.lastKey = ""
 	m.showHelp = false
 
-	// Initialize Viewport with vertical space reserved for header & footer
 	headerHeight := 4
 	footerHeight := 4
 	verticalMarginHeight := headerHeight + footerHeight
@@ -553,7 +480,6 @@ func wrapText(text string, width int) string {
 	return strings.Join(wrappedParagraphs, "\n")
 }
 
-// getProcessedChapterContent highlights text with active search queries
 func (m *model) getProcessedChapterContent() string {
 	if len(m.chapters) == 0 {
 		return ""
@@ -566,7 +492,6 @@ func (m *model) getProcessedChapterContent() string {
 	return wrapped
 }
 
-// highlightText inserts Lip Gloss styles into matching search text
 func highlightText(text, query string, activeMatchIndex int, matches []int) string {
 	if query == "" {
 		return text
@@ -606,7 +531,6 @@ func highlightText(text, query string, activeMatchIndex int, matches []int) stri
 	return buf.String()
 }
 
-// updateSearchMatches searches for all query matches in current chapter
 func (m *model) updateSearchMatches() {
 	if m.searchQuery == "" {
 		m.searchMatches = nil
@@ -640,7 +564,6 @@ func (m *model) updateSearchMatches() {
 	}
 }
 
-// scrollToMatch scrolls the viewport to center the current active match
 func (m *model) scrollToMatch() {
 	if m.searchActiveIndex < 0 || m.searchActiveIndex >= len(m.searchMatches) {
 		return
@@ -664,8 +587,10 @@ func (m *model) scrollToMatch() {
 	m.viewport.SetYOffset(targetY)
 }
 
-// Bubble Tea Model Methods
 func (m model) Init() tea.Cmd {
+	if len(m.files) == 0 && m.mode == modeFilePicker && !m.loading {
+		return loadFiles()
+	}
 	return nil
 }
 
@@ -684,6 +609,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Height = msg.Height - verticalMarginHeight
 			m.viewport.SetContent(m.getProcessedChapterContent())
 		}
+		return m, nil
+
+	case loadedFilesMsg:
+		m.files = msg
+		m.loading = false
+		m.filterFiles()
+		return m, nil
+
+	case errMsg:
+		m.errorMessage = msg.Error()
+		m.loading = false
 		return m, nil
 
 	case tea.KeyMsg:
@@ -734,12 +670,11 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
-	case "f":
-		err := m.globalSearch()
-		if err != nil {
-			m.errorMessage = err.Error()
-		}
-		return m, nil
+	case "r":
+		m.loading = true
+		m.files = nil
+		m.filteredFiles = nil
+		return m, loadFiles()
 
 	case "up", "k":
 		if len(m.filteredFiles) > 0 {
@@ -751,33 +686,17 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
 		}
 
-	case "left", "h":
-		parent := filepath.Dir(m.currentPath)
-		if parent != m.currentPath {
-			m.currentPath = parent
-			m.refreshFiles()
-		}
-
 	case "right", "l", "enter":
 		if len(m.filteredFiles) == 0 {
 			break
 		}
 		selected := m.filteredFiles[m.fileIndex]
-		if selected.isDir {
-			if selected.name == ".." {
-				m.currentPath = filepath.Dir(m.currentPath)
-			} else {
-				m.currentPath = filepath.Join(m.currentPath, selected.name)
-			}
-			m.refreshFiles()
+		filePath := selected.fullPath
+		err := m.loadBook(filePath)
+		if err != nil {
+			m.errorMessage = err.Error()
 		} else {
-			filePath := selected.fullPath
-			err := m.loadBook(filePath)
-			if err != nil {
-				m.errorMessage = err.Error()
-			} else {
-				m.errorMessage = ""
-			}
+			m.errorMessage = ""
 		}
 	}
 	return m, nil
@@ -797,7 +716,6 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle 'gg' sequence
 	if m.lastKey == "g" && keyStr == "g" {
 		m.viewport.GotoTop()
 		m.lastKey = ""
@@ -820,7 +738,6 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.mode = modeFilePicker
 				m.errorMessage = ""
-				m.refreshFiles()
 			}
 		}
 
@@ -864,13 +781,6 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.viewport.SetContent(m.getProcessedChapterContent())
 			m.viewport.GotoTop()
 		}
-
-	case "/":
-		m.searching = true
-		m.searchQuery = ""
-		m.searchMatches = nil
-		m.searchActiveIndex = -1
-		m.viewport.SetContent(m.getProcessedChapterContent())
 
 	case "n":
 		if len(m.searchMatches) > 0 {
@@ -936,28 +846,22 @@ func (m model) View() string {
 func (m model) viewFilePicker() string {
 	var s strings.Builder
 
-	// Header
-	headerText := "📁 TUI E-Reader - Choose E-Book"
-	if m.globalSearching {
-		headerText = "🔍 TUI E-Reader - Global Search Results (fd)"
-	}
-	s.WriteString(styleFilePickerHeader.Render(headerText))
+	s.WriteString(styleFilePickerHeader.Render("🔍 TUI E-Reader - Search Books"))
 	s.WriteString("\n\n")
-	
-	pathText := fmt.Sprintf("Current Directory: %s", m.currentPath)
-	if m.globalSearching {
-		pathText = "Searching in $HOME"
+
+	if m.loading {
+		s.WriteString("  Searching for books with 'fd'...\n\n")
+	} else {
+		s.WriteString(fmt.Sprintf("  Found %d books in $HOME\n\n", len(m.files)))
 	}
-	s.WriteString(pathText + "\n\n")
 
 	if m.errorMessage != "" {
 		s.WriteString(styleError.Render(fmt.Sprintf("Error: %s", m.errorMessage)))
 		s.WriteString("\n\n")
 	}
 
-	// File List
-	if len(m.filteredFiles) == 0 {
-		s.WriteString("  (No EPUB or PDF files found in this folder)\n")
+	if !m.loading && len(m.filteredFiles) == 0 {
+		s.WriteString("  (No EPUB or PDF files found)\n")
 	} else {
 		for i, file := range m.filteredFiles {
 			prefix := "  "
@@ -966,23 +870,13 @@ func (m model) viewFilePicker() string {
 			}
 
 			icon := "▫️ "
-			nameStr := file.name
-			if file.isDir {
-				icon = "📁 "
-				nameStr = styleFileDir.Render(file.name)
-			} else if strings.HasSuffix(strings.ToLower(file.name), ".epub") {
+			if strings.HasSuffix(strings.ToLower(file.name), ".epub") {
 				icon = "📘 "
 			} else if strings.HasSuffix(strings.ToLower(file.name), ".pdf") {
 				icon = "📕 "
 			}
 
-			var sizeStr string
-			if !file.isDir {
-				sizeStr = fmt.Sprintf(" (%s)", formatBytes(file.size))
-			}
-
-			line := fmt.Sprintf("%s%s%s%s", prefix, icon, nameStr, sizeStr)
-
+			line := fmt.Sprintf("%s%s%s", prefix, icon, file.name)
 			if i == m.fileIndex {
 				s.WriteString(styleFilePickerSelected.Render(line))
 			} else {
@@ -992,7 +886,6 @@ func (m model) viewFilePicker() string {
 		}
 	}
 
-	// Pad file picker to fill screen height
 	linesCount := strings.Count(s.String(), "\n")
 	neededNewlines := m.height - linesCount - 4
 	for i := 0; i < neededNewlines; i++ {
@@ -1007,15 +900,13 @@ func (m model) viewFilePicker() string {
 		s.WriteString("\n")
 	}
 
-	// Footer Keybindings
-	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Search  •  f: Global Search  •  h: Back  •  q: Exit"))
+	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Filter  •  r: Refresh  •  q: Exit"))
 	return s.String()
 }
 
 func (m model) viewReader() string {
 	var s strings.Builder
 
-	// Header Rendering
 	bookType := strings.ToUpper(m.metadata.Type)
 	titleStr := styleTitle.Render(fmt.Sprintf("[%s] %s", bookType, m.metadata.Title))
 	authorStr := styleAuthor.Render(fmt.Sprintf(" by %s", m.metadata.Author))
@@ -1024,7 +915,6 @@ func (m model) viewReader() string {
 	s.WriteString(styleHeader.Render(fmt.Sprintf("%s%s\n%s", titleStr, authorStr, chapterTitleStr)))
 	s.WriteString("\n\n")
 
-	// Viewport Content or Help Menu
 	if m.showHelp {
 		s.WriteString(m.viewHelp())
 	} else {
@@ -1032,7 +922,6 @@ func (m model) viewReader() string {
 	}
 	s.WriteString("\n\n")
 
-	// Footer Progress/Status or Search Bar
 	if m.searching {
 		s.WriteString(fmt.Sprintf("/%s█", m.searchQuery))
 	} else {
@@ -1076,7 +965,7 @@ func (m model) viewHelp() string {
 		{"n", "Next search match"},
 		{"N", "Previous search match"},
 		{"?, u", "Toggle Help screen"},
-		{"q", "Go back to file list / Exit"},
+		{"q", "Go back to search list / Exit"},
 		{"ctrl+c", "Quit program"},
 	}
 
@@ -1084,7 +973,6 @@ func (m model) viewHelp() string {
 		s.WriteString(fmt.Sprintf("  %s %s\n", styleHelpKey.Render(fmt.Sprintf("%-16s", k[0])), styleHelpDesc.Render(k[1])))
 	}
 
-	// Pad help screen to fill viewport height
 	linesCount := strings.Count(s.String(), "\n")
 	neededNewlines := m.viewport.Height - linesCount
 	for i := 0; i < neededNewlines; i++ {
@@ -1109,7 +997,7 @@ func formatBytes(b int64) string {
 
 func main() {
 	var initialModel model
-	initialModel.currentPath = "."
+	initialModel.loading = true
 
 	if len(os.Args) > 1 {
 		filePath := os.Args[1]
@@ -1125,7 +1013,6 @@ func main() {
 		}
 
 		if info.IsDir() {
-			initialModel.currentPath = filePath
 			initialModel.cliMode = false
 		} else {
 			initialModel.cliMode = true
@@ -1137,14 +1024,6 @@ func main() {
 		}
 	} else {
 		initialModel.cliMode = false
-	}
-
-	if !initialModel.cliMode {
-		err := initialModel.refreshFiles()
-		if err != nil {
-			fmt.Printf("Error scanning directory: %s\n", err)
-			os.Exit(1)
-		}
 	}
 
 	p := tea.NewProgram(initialModel, tea.WithAltScreen())
