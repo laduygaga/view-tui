@@ -656,8 +656,12 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyEsc:
-		m.filePickerSearchQuery = ""
-		m.filterFiles()
+		if m.filePickerSearchQuery != "" {
+			m.filePickerSearchQuery = ""
+			m.filterFiles()
+		} else {
+			return m, tea.Quit
+		}
 		return m, nil
 
 	case tea.KeyCtrlC:
@@ -667,6 +671,18 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.filePickerSearchQuery) > 0 {
 			m.filePickerSearchQuery = m.filePickerSearchQuery[:len(m.filePickerSearchQuery)-1]
 			m.filterFiles()
+		}
+		return m, nil
+
+	case tea.KeyCtrlJ:
+		if len(m.filteredFiles) > 0 {
+			m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
+		}
+		return m, nil
+
+	case tea.KeyCtrlK:
+		if len(m.filteredFiles) > 0 {
+			m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
 		}
 		return m, nil
 
@@ -683,30 +699,6 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyRunes, tea.KeySpace:
-		if keyStr == "j" || keyStr == "k" {
-			if keyStr == "k" {
-				if len(m.filteredFiles) > 0 {
-					m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
-				}
-			} else {
-				if len(m.filteredFiles) > 0 {
-					m.fileIndex = (m.fileIndex + 1) % len(m.filteredFiles)
-				}
-			}
-			return m, nil
-		}
-
-		if keyStr == "q" && m.filePickerSearchQuery == "" {
-			return m, tea.Quit
-		}
-		
-		if keyStr == "r" && m.filePickerSearchQuery == "" {
-			m.loading = true
-			m.files = nil
-			m.filteredFiles = nil
-			return m, loadFiles()
-		}
-
 		m.filePickerSearchQuery += keyStr
 		m.filterFiles()
 		return m, nil
@@ -906,7 +898,7 @@ func (m model) viewFilePicker() string {
 		s.WriteString("\n")
 	}
 
-	s.WriteString(styleFooter.Render("j/k: Navigate  •  Enter: Open  •  r: Refresh  •  Esc: Clear Search  •  q: Exit"))
+	s.WriteString(styleFooter.Render("Ctrl-j/k or Arrows: Navigate  •  Enter: Open  •  Esc: Clear/Exit"))
 	return s.String()
 }
 
