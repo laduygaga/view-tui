@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -39,9 +40,10 @@ const (
 
 // fileEntry represents an item in the directory list
 type fileEntry struct {
-	name  string
-	isDir bool
-	size  int64
+	name     string
+	fullPath string
+	isDir    bool
+	size     int64
 }
 
 // Lip Gloss Styles
@@ -126,6 +128,7 @@ type model struct {
 
 	filePickerSearching    bool
 	filePickerSearchQuery  string
+	globalSearching        bool
 
 	showHelp            bool
 	lastKey             string
@@ -363,17 +366,71 @@ func (m *model) refreshFiles() error {
 
 		if isDir || ext == ".pdf" || ext == ".epub" {
 			m.files = append(m.files, fileEntry{
-				name:  name,
-				isDir: isDir,
-				size:  info.Size(),
+				name:     name,
+				fullPath: filepath.Join(m.currentPath, name),
+				isDir:    isDir,
+				size:     info.Size(),
 			})
 		}
 	}
 
 	m.filePickerSearchQuery = ""
 	m.filePickerSearching = false
+	m.globalSearching = false
 	m.filterFiles()
 
+	return nil
+}
+
+func (m *model) globalSearch() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	excludes := []string{
+		".git", "__pycache__", "node_modules", ".local", ".cache",
+		".cargo", ".npm", ".nvm", ".pyenv", ".venv", "venv",
+		".rbenv", "rbenv", ".rustup", ".vscode", ".wine", ".wine32", ".wine64",
+	}
+
+	args := []string{"-t", "f", "-H", "-e", "pdf", "-e", "epub"}
+	for _, ex := range excludes {
+		args = append(args, "-E", ex)
+	}
+	args = append(args, "--color", "never", home)
+
+	cmd := exec.Command("fd", args...)
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("fd error: %v (make sure 'fd' is installed)", err)
+	}
+
+	lines := strings.Split(string(output), "\n")
+	m.files = nil
+	for _, line := range lines {
+		path := strings.TrimSpace(line)
+		if path == "" {
+			continue
+		}
+
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+
+		m.files = append(m.files, fileEntry{
+			name:     filepath.Base(path),
+			fullPath: path,
+			isDir:    false,
+			size:     info.Size(),
+		})
+	}
+
+	m.globalSearching = true
+	m.filePickerSearchQuery = ""
+	m.filePickerSearching = false
+	m.filterFiles()
 	return nil
 }
 
@@ -677,6 +734,13 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
+	case "f":
+		err := m.globalSearch()
+		if err != nil {
+			m.errorMessage = err.Error()
+		}
+		return m, nil
+
 	case "up", "k":
 		if len(m.filteredFiles) > 0 {
 			m.fileIndex = (m.fileIndex - 1 + len(m.filteredFiles)) % len(m.filteredFiles)
@@ -707,7 +771,7 @@ func (m model) updateFilePicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.refreshFiles()
 		} else {
-			filePath := filepath.Join(m.currentPath, selected.name)
+			filePath := selected.fullPath
 			err := m.loadBook(filePath)
 			if err != nil {
 				m.errorMessage = err.Error()
@@ -873,9 +937,18 @@ func (m model) viewFilePicker() string {
 	var s strings.Builder
 
 	// Header
-	s.WriteString(styleFilePickerHeader.Render("📁 TUI E-Reader - Choose E-Book"))
+	headerText := "📁 TUI E-Reader - Choose E-Book"
+	if m.globalSearching {
+		headerText = "🔍 TUI E-Reader - Global Search Results (fd)"
+	}
+	s.WriteString(styleFilePickerHeader.Render(headerText))
 	s.WriteString("\n\n")
-	s.WriteString(fmt.Sprintf("Current Directory: %s\n\n", m.currentPath))
+	
+	pathText := fmt.Sprintf("Current Directory: %s", m.currentPath)
+	if m.globalSearching {
+		pathText = "Searching in $HOME"
+	}
+	s.WriteString(pathText + "\n\n")
 
 	if m.errorMessage != "" {
 		s.WriteString(styleError.Render(fmt.Sprintf("Error: %s", m.errorMessage)))
@@ -935,7 +1008,7 @@ func (m model) viewFilePicker() string {
 	}
 
 	// Footer Keybindings
-	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Search  •  h: Back  •  q: Exit"))
+	s.WriteString(styleFooter.Render("j/k: Navigate  •  l/Enter: Open  •  /: Search  •  f: Global Search  •  h: Back  •  q: Exit"))
 	return s.String()
 }
 
