@@ -90,11 +90,11 @@ var (
 			Bold(true)
 
 	styleHelpKey = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#62FF00")).
+			Foreground(lipgloss.Color("#2E5BFF")).
 			Bold(true)
 
 	styleHelpDesc = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#8A8A8A"))
+			Foreground(lipgloss.Color("#4A4A4A"))
 
 	styleError = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#FF0000")).
