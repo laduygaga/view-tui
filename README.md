@@ -9,6 +9,7 @@ A terminal-based E-Reader for EPUB and PDF files built with [Bubble Tea](https:/
 - **Immediate Typing**: Simply launch and type to filter books instantly—no extra keys required.
 - **Readline / Shell Editing**: Full support for standard editing shortcuts (`Ctrl-a`, `Ctrl-e`, `Ctrl-u`, `Ctrl-k`, `Ctrl-w`, and arrow keys) in all search fields.
 - **Vim Navigation**: Scroll, read, and flip chapters easily with familiar Vim shortcuts.
+- **Vietnamese Translation**: Press `t` while reading to translate any chapter or page to Vietnamese instantly, with response caching and seamless toggling back to original text.
 - **High Readability**: Automatic word wrapping with elegant padding margins on both sides for a clean e-reader feel.
 
 ## Installation
@@ -60,6 +61,7 @@ Or open a specific book directly:
 | `G` | Jump to bottom of current chapter/page |
 | `l` / `Right` / `Space` | Next chapter (EPUB) or page (PDF) |
 | `h` / `Left` / `p` | Previous chapter (EPUB) or page (PDF) |
+| `t` | Toggle Vietnamese translation |
 | `/` | Search/highlight text inside current chapter/page |
 | `n` / `Ctrl-n` | Next search match (auto-scrolls to center) |
 | `N` / `Ctrl-p` | Previous search match (auto-scrolls to center) |

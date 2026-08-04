@@ -5,10 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -203,6 +207,11 @@ type model struct {
 
 	showHelp            bool
 	lastKey             string
+
+	showingTranslation  bool
+	translating         bool
+	translatedChapters  map[int]string
+	translationError    string
 }
 
 func (m *model) saveCurrentPosition() {
@@ -291,6 +300,125 @@ func cleanText(s string) string {
 		}
 	}
 	return strings.TrimSpace(strings.Join(cleaned, "\n"))
+}
+
+type translatedMsg struct {
+	chapterIndex int
+	translated   string
+	err          error
+}
+
+func translateChapterCmd(chapterIndex int, body string) tea.Cmd {
+	return func() tea.Msg {
+		translated, err := translateToVietnamese(body)
+		return translatedMsg{
+			chapterIndex: chapterIndex,
+			translated:   translated,
+			err:          err,
+		}
+	}
+}
+
+func translateToVietnamese(text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", nil
+	}
+
+	const maxChunkSize = 2500
+	paragraphs := strings.Split(text, "\n")
+
+	var chunks []string
+	var currentChunk strings.Builder
+
+	for _, p := range paragraphs {
+		if currentChunk.Len() > 0 && currentChunk.Len()+len(p)+1 > maxChunkSize {
+			chunks = append(chunks, currentChunk.String())
+			currentChunk.Reset()
+		}
+		if currentChunk.Len() > 0 {
+			currentChunk.WriteString("\n")
+		}
+		currentChunk.WriteString(p)
+	}
+	if currentChunk.Len() > 0 {
+		chunks = append(chunks, currentChunk.String())
+	}
+
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+	}
+
+	var translatedChunks []string
+	for _, chunk := range chunks {
+		if strings.TrimSpace(chunk) == "" {
+			translatedChunks = append(translatedChunks, chunk)
+			continue
+		}
+
+		formData := url.Values{}
+		formData.Set("q", chunk)
+
+		reqURL := "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=vi&dt=t"
+		req, err := http.NewRequest("POST", reqURL, strings.NewReader(formData.Encode()))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return "", err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("HTTP %d from translate API", resp.StatusCode)
+		}
+
+		translatedChunk, err := parseGoogleTranslateResponse(bodyBytes)
+		if err != nil {
+			return "", err
+		}
+		translatedChunks = append(translatedChunks, translatedChunk)
+	}
+
+	return strings.Join(translatedChunks, "\n"), nil
+}
+
+func parseGoogleTranslateResponse(data []byte) (string, error) {
+	var raw []interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return "", err
+	}
+
+	if len(raw) == 0 {
+		return "", fmt.Errorf("empty translation response")
+	}
+
+	segments, ok := raw[0].([]interface{})
+	if !ok {
+		return "", fmt.Errorf("unexpected response structure")
+	}
+
+	var sb strings.Builder
+	for _, seg := range segments {
+		segList, ok := seg.([]interface{})
+		if !ok || len(segList) == 0 {
+			continue
+		}
+		translatedText, ok := segList[0].(string)
+		if ok {
+			sb.WriteString(translatedText)
+		}
+	}
+
+	return sb.String(), nil
 }
 
 func readEpub(filePath string) ([]Chapter, BookMetadata, error) {
@@ -518,6 +646,10 @@ func (m *model) loadBook(filePath string) error {
 	m.searchActiveIndex = -1
 	m.lastKey = ""
 	m.showHelp = false
+	m.showingTranslation = false
+	m.translating = false
+	m.translatedChapters = make(map[int]string)
+	m.translationError = ""
 
 	headerHeight := 4
 	footerHeight := 4
@@ -571,16 +703,20 @@ func wrapText(text string, width int) string {
 		var line strings.Builder
 		line.WriteString("  ")
 		line.WriteString(words[0])
+		currentRuneCount := utf8.RuneCountInString(words[0])
 
 		for _, word := range words[1:] {
-			if line.Len()-2+1+len(word) > targetWidth {
+			wordRunes := utf8.RuneCountInString(word)
+			if currentRuneCount+1+wordRunes > targetWidth {
 				wrappedParagraphs = append(wrappedParagraphs, line.String())
 				line.Reset()
 				line.WriteString("  ")
 				line.WriteString(word)
+				currentRuneCount = wordRunes
 			} else {
 				line.WriteString(" ")
 				line.WriteString(word)
+				currentRuneCount += 1 + wordRunes
 			}
 		}
 		if line.Len() > 2 {
@@ -591,11 +727,23 @@ func wrapText(text string, width int) string {
 	return strings.Join(wrappedParagraphs, "\n")
 }
 
+func (m *model) getChapterBody() string {
+	if len(m.chapters) == 0 {
+		return ""
+	}
+	if m.showingTranslation {
+		if translated, ok := m.translatedChapters[m.currentChapterIndex]; ok {
+			return translated
+		}
+	}
+	return m.chapters[m.currentChapterIndex].Body
+}
+
 func (m *model) getProcessedChapterContent() string {
 	if len(m.chapters) == 0 {
 		return ""
 	}
-	body := m.chapters[m.currentChapterIndex].Body
+	body := m.getChapterBody()
 	wrapped := wrapText(body, m.width)
 	if m.searchQuery != "" {
 		return highlightText(wrapped, m.searchQuery, m.searchActiveIndex, m.searchMatches)
@@ -649,7 +797,7 @@ func (m *model) updateSearchMatches() {
 		return
 	}
 
-	body := m.chapters[m.currentChapterIndex].Body
+	body := m.getChapterBody()
 	wrapped := wrapText(body, m.width)
 	lowerBody := strings.ToLower(wrapped)
 	lowerQuery := strings.ToLower(m.searchQuery)
@@ -680,7 +828,7 @@ func (m *model) scrollToMatch() {
 		return
 	}
 
-	body := m.chapters[m.currentChapterIndex].Body
+	body := m.getChapterBody()
 	wrapped := wrapText(body, m.width)
 	matchPos := m.searchMatches[m.searchActiveIndex]
 
@@ -733,6 +881,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.errorMessage = msg.Error()
 		m.loading = false
+		return m, nil
+
+	case translatedMsg:
+		m.translating = false
+		if msg.err != nil {
+			m.translationError = fmt.Sprintf("Translation error: %v", msg.err)
+			m.showingTranslation = false
+		} else {
+			if m.translatedChapters == nil {
+				m.translatedChapters = make(map[int]string)
+			}
+			m.translatedChapters[msg.chapterIndex] = msg.translated
+			if msg.chapterIndex == m.currentChapterIndex {
+				m.showingTranslation = true
+				m.translationError = ""
+				m.viewport.SetContent(m.getProcessedChapterContent())
+			}
+		}
 		return m, nil
 
 	case tea.KeyMsg:
@@ -868,9 +1034,16 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchQuery = ""
 			m.searchMatches = nil
 			m.searchActiveIndex = -1
-			m.viewport.SetContent(m.getProcessedChapterContent())
 			m.viewport.GotoTop()
 			m.saveCurrentPosition()
+			if m.showingTranslation {
+				if _, ok := m.translatedChapters[m.currentChapterIndex]; !ok && !m.translating {
+					m.translating = true
+					m.translationError = ""
+					return m, translateChapterCmd(m.currentChapterIndex, m.chapters[m.currentChapterIndex].Body)
+				}
+			}
+			m.viewport.SetContent(m.getProcessedChapterContent())
 		}
 
 	case "right", "l", "space":
@@ -879,9 +1052,33 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchQuery = ""
 			m.searchMatches = nil
 			m.searchActiveIndex = -1
-			m.viewport.SetContent(m.getProcessedChapterContent())
 			m.viewport.GotoTop()
 			m.saveCurrentPosition()
+			if m.showingTranslation {
+				if _, ok := m.translatedChapters[m.currentChapterIndex]; !ok && !m.translating {
+					m.translating = true
+					m.translationError = ""
+					return m, translateChapterCmd(m.currentChapterIndex, m.chapters[m.currentChapterIndex].Body)
+				}
+			}
+			m.viewport.SetContent(m.getProcessedChapterContent())
+		}
+
+	case "t":
+		if m.showingTranslation {
+			m.showingTranslation = false
+			m.translationError = ""
+			m.viewport.SetContent(m.getProcessedChapterContent())
+		} else {
+			if translated, ok := m.translatedChapters[m.currentChapterIndex]; ok && translated != "" {
+				m.showingTranslation = true
+				m.translationError = ""
+				m.viewport.SetContent(m.getProcessedChapterContent())
+			} else if !m.translating {
+				m.translating = true
+				m.translationError = ""
+				return m, translateChapterCmd(m.currentChapterIndex, m.chapters[m.currentChapterIndex].Body)
+			}
 		}
 
 	case "n", "ctrl+n":
@@ -1048,6 +1245,9 @@ func (m model) viewReader() string {
 	titleStr := styleTitle.Render(fmt.Sprintf("[%s] %s", bookType, m.metadata.Title))
 	authorStr := styleAuthor.Render(fmt.Sprintf(" by %s", m.metadata.Author))
 	chapterTitleStr := fmt.Sprintf("Chapter: %s", m.chapters[m.currentChapterIndex].Title)
+	if m.showingTranslation {
+		chapterTitleStr += " [VIETNAMESE]"
+	}
 
 	s.WriteString(styleHeader.Render(fmt.Sprintf("%s%s\n%s", titleStr, authorStr, chapterTitleStr)))
 	s.WriteString("\n\n")
@@ -1066,9 +1266,20 @@ func (m model) viewReader() string {
 		if len(m.chapters) > 0 {
 			pct = int(float64(m.currentChapterIndex) / float64(len(m.chapters)) * 100)
 		}
-		
+
 		progressText := styleProgress.Render(fmt.Sprintf("Progress: %d/%d (%d%%)", m.currentChapterIndex+1, len(m.chapters), pct))
-		
+
+		var translateStatus string
+		if m.translating {
+			translateStatus = " | ⏳ Translating to Vietnamese..."
+		} else if m.showingTranslation {
+			translateStatus = " | [VN Mode: Press 't' for Original]"
+		} else if m.translationError != "" {
+			translateStatus = fmt.Sprintf(" | %s", styleError.Render(m.translationError))
+		} else {
+			translateStatus = " | [t: Translate to VN]"
+		}
+
 		var searchText string
 		if m.searchQuery != "" {
 			matchIndexText := "no matches"
@@ -1078,7 +1289,7 @@ func (m model) viewReader() string {
 			searchText = fmt.Sprintf(" | Search: \"%s\" (%s, n/N)", m.searchQuery, matchIndexText)
 		}
 
-		s.WriteString(styleFooter.Render(fmt.Sprintf("%s%s  •  [? / u: Help]", progressText, searchText)))
+		s.WriteString(styleFooter.Render(fmt.Sprintf("%s%s%s  •  [? / u: Help]", progressText, translateStatus, searchText)))
 	}
 
 	return s.String()
@@ -1098,6 +1309,7 @@ func (m model) viewHelp() string {
 		{"G", "Go to Bottom of chapter"},
 		{"l, Right, Space", "Next Chapter / Page"},
 		{"h, Left, p", "Previous Chapter / Page"},
+		{"t", "Toggle Vietnamese translation"},
 		{"/", "Search within chapter"},
 		{"n", "Next search match"},
 		{"N", "Previous search match"},

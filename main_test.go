@@ -88,3 +88,42 @@ func TestReadingPositionPersistence(t *testing.T) {
 		t.Errorf("Expected YOffset %d, got %d", expectedYOffset, pos.YOffset)
 	}
 }
+
+func TestParseGoogleTranslateResponse(t *testing.T) {
+	sampleJSON := `[[["Xin chào thế giới. ","Hello world. ",null,null,3,null,null,[[]],[]],["Đây là một bài kiểm tra.","This is a test.",null,null,3,null,null,[[]],[]]],null,"en"]`
+	result, err := parseGoogleTranslateResponse([]byte(sampleJSON))
+	if err != nil {
+		t.Fatalf("Failed to parse response: %v", err)
+	}
+	expected := "Xin chào thế giới. Đây là một bài kiểm tra."
+	if result != expected {
+		t.Errorf("Expected %q, got %q", expected, result)
+	}
+}
+
+func TestWrapTextWithVietnamese(t *testing.T) {
+	text := "Xin chào thế giới. Đây là một đoạn văn bản tiếng Việt với các từ có dấu."
+	wrapped := wrapText(text, 30)
+	if wrapped == "" {
+		t.Error("Expected non-empty wrapped text")
+	}
+	lines := strings.Split(wrapped, "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "  ") {
+			l = l[2:]
+		}
+		if len([]rune(l)) > 26 {
+			t.Errorf("Line exceeds target width: %q (rune count: %d)", l, len([]rune(l)))
+		}
+	}
+}
+
+func TestTranslateToVietnamese(t *testing.T) {
+	res, err := translateToVietnamese("Hello world. How are you?")
+	if err != nil {
+		t.Fatalf("Translate error: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(res), "chào") && !strings.Contains(strings.ToLower(res), "thế giới") {
+		t.Errorf("Expected Vietnamese translation, got: %s", res)
+	}
+}
