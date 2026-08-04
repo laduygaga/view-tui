@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -40,6 +41,86 @@ type fileEntry struct {
 	name     string
 	fullPath string
 	size     int64
+}
+
+type ReadingPosition struct {
+	ChapterIndex int `json:"chapter_index"`
+	YOffset      int `json:"y_offset"`
+}
+
+func getPositionsFilePath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		configDir = filepath.Join(homeDir, ".config")
+	}
+	appDir := filepath.Join(configDir, "view-tui")
+	if err := os.MkdirAll(appDir, 0755); err != nil {
+		return "", err
+	}
+	return filepath.Join(appDir, "positions.json"), nil
+}
+
+func loadPositions() (map[string]ReadingPosition, error) {
+	path, err := getPositionsFilePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]ReadingPosition), nil
+		}
+		return nil, err
+	}
+	var positions map[string]ReadingPosition
+	if err := json.Unmarshal(data, &positions); err != nil {
+		return make(map[string]ReadingPosition), nil
+	}
+	if positions == nil {
+		positions = make(map[string]ReadingPosition)
+	}
+	return positions, nil
+}
+
+func saveBookPosition(filePath string, chapterIndex int, yOffset int) error {
+	absPath, err := filepath.Abs(filePath)
+	if err == nil {
+		filePath = absPath
+	}
+	positions, err := loadPositions()
+	if err != nil {
+		positions = make(map[string]ReadingPosition)
+	}
+	positions[filePath] = ReadingPosition{
+		ChapterIndex: chapterIndex,
+		YOffset:      yOffset,
+	}
+	posPath, err := getPositionsFilePath()
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(positions, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(posPath, data, 0644)
+}
+
+func getBookPosition(filePath string) (ReadingPosition, bool) {
+	absPath, err := filepath.Abs(filePath)
+	if err == nil {
+		filePath = absPath
+	}
+	positions, err := loadPositions()
+	if err != nil {
+		return ReadingPosition{}, false
+	}
+	pos, found := positions[filePath]
+	return pos, found
 }
 
 var (
@@ -104,6 +185,7 @@ type model struct {
 	loading             bool
 	cliMode             bool // true if path was passed as argument
 
+	currentFilePath     string
 	metadata            BookMetadata
 	chapters            []Chapter
 	currentChapterIndex int
@@ -121,6 +203,12 @@ type model struct {
 
 	showHelp            bool
 	lastKey             string
+}
+
+func (m *model) saveCurrentPosition() {
+	if m.mode == modeReader && m.currentFilePath != "" {
+		_ = saveBookPosition(m.currentFilePath, m.currentChapterIndex, m.viewport.YOffset)
+	}
 }
 
 func htmlToTextAndTitle(r io.Reader) (string, string) {
@@ -392,9 +480,13 @@ func (m *model) filterFiles() {
 }
 
 func (m *model) loadBook(filePath string) error {
+	absPath, err := filepath.Abs(filePath)
+	if err == nil {
+		filePath = absPath
+	}
+
 	var chapters []Chapter
 	var meta BookMetadata
-	var err error
 
 	ext := strings.ToLower(filepath.Ext(filePath))
 	if ext == ".epub" {
@@ -409,9 +501,17 @@ func (m *model) loadBook(filePath string) error {
 		return err
 	}
 
+	m.currentFilePath = filePath
 	m.chapters = chapters
 	m.metadata = meta
-	m.currentChapterIndex = 0
+
+	pos, found := getBookPosition(filePath)
+	if found && pos.ChapterIndex >= 0 && pos.ChapterIndex < len(chapters) {
+		m.currentChapterIndex = pos.ChapterIndex
+	} else {
+		m.currentChapterIndex = 0
+	}
+
 	m.mode = modeReader
 	m.searchQuery = ""
 	m.searchMatches = nil
@@ -434,7 +534,11 @@ func (m *model) loadBook(filePath string) error {
 
 	m.viewport = viewport.New(vpWidth, vpHeight)
 	m.viewport.SetContent(m.getProcessedChapterContent())
-	m.viewport.GotoTop()
+	if found && pos.ChapterIndex == m.currentChapterIndex {
+		m.viewport.SetYOffset(pos.YOffset)
+	} else {
+		m.viewport.GotoTop()
+	}
 
 	return nil
 }
@@ -612,9 +716,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		verticalMarginHeight := headerHeight + footerHeight
 
 		if m.mode == modeReader {
+			prevOffset := m.viewport.YOffset
 			m.viewport.Width = msg.Width
 			m.viewport.Height = msg.Height - verticalMarginHeight
 			m.viewport.SetContent(m.getProcessedChapterContent())
+			m.viewport.SetYOffset(prevOffset)
 		}
 		return m, nil
 
@@ -705,6 +811,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.lastKey == "g" && keyStr == "g" {
 		m.viewport.GotoTop()
 		m.lastKey = ""
+		m.saveCurrentPosition()
 		return m, nil
 	}
 	if keyStr != "g" {
@@ -713,9 +820,11 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch keyStr {
 	case "ctrl+c":
+		m.saveCurrentPosition()
 		return m, tea.Quit
 
 	case "q":
+		m.saveCurrentPosition()
 		if m.showHelp {
 			m.showHelp = false
 		} else {
@@ -732,21 +841,26 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "up", "k":
 		m.viewport.LineUp(1)
+		m.saveCurrentPosition()
 
 	case "down", "j":
 		m.viewport.LineDown(1)
+		m.saveCurrentPosition()
 
 	case "ctrl+u":
 		m.viewport.HalfPageUp()
+		m.saveCurrentPosition()
 
 	case "ctrl+d":
 		m.viewport.HalfPageDown()
+		m.saveCurrentPosition()
 
 	case "g":
 		m.lastKey = "g"
 
 	case "G":
 		m.viewport.GotoBottom()
+		m.saveCurrentPosition()
 
 	case "left", "h", "p":
 		if m.currentChapterIndex > 0 {
@@ -756,6 +870,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = -1
 			m.viewport.SetContent(m.getProcessedChapterContent())
 			m.viewport.GotoTop()
+			m.saveCurrentPosition()
 		}
 
 	case "right", "l", "space":
@@ -766,6 +881,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = -1
 			m.viewport.SetContent(m.getProcessedChapterContent())
 			m.viewport.GotoTop()
+			m.saveCurrentPosition()
 		}
 
 	case "n", "ctrl+n":
@@ -773,6 +889,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = (m.searchActiveIndex + 1) % len(m.searchMatches)
 			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
+			m.saveCurrentPosition()
 		}
 
 	case "N", "ctrl+p":
@@ -780,6 +897,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = (m.searchActiveIndex - 1 + len(m.searchMatches)) % len(m.searchMatches)
 			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
+			m.saveCurrentPosition()
 		}
 	}
 
@@ -792,6 +910,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.searching = false
 		m.updateSearchMatches()
 		m.viewport.SetContent(m.getProcessedChapterContent())
+		m.saveCurrentPosition()
 		return m, nil
 
 	case tea.KeyEsc, tea.KeyCtrlC:
@@ -809,6 +928,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = (m.searchActiveIndex + 1) % len(m.searchMatches)
 			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
+			m.saveCurrentPosition()
 		}
 		return m, nil
 
@@ -818,6 +938,7 @@ func (m model) updateSearch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.searchActiveIndex = (m.searchActiveIndex - 1 + len(m.searchMatches)) % len(m.searchMatches)
 			m.scrollToMatch()
 			m.viewport.SetContent(m.getProcessedChapterContent())
+			m.saveCurrentPosition()
 		}
 		return m, nil
 	}
