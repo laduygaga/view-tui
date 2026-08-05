@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -489,36 +491,99 @@ func readPdf(filePath string) ([]Chapter, BookMetadata, error) {
 		Type:   "pdf",
 	}
 
-	var chapters []Chapter
 	numPages := r.NumPage()
+	if numPages == 0 {
+		return nil, meta, fmt.Errorf("no pages found in pdf")
+	}
+
+	pageChapters := make([]Chapter, numPages)
+
+	numWorkers := runtime.NumCPU() * 2
+	if numWorkers < 4 {
+		numWorkers = 4
+	}
+	if numWorkers > numPages {
+		numWorkers = numPages
+	}
+
+	pageChan := make(chan int, numPages)
 	for i := 1; i <= numPages; i++ {
-		p := r.Page(i)
-		if p.V.IsNull() {
-			continue
-		}
+		pageChan <- i
+	}
+	close(pageChan)
 
-		rows, err := p.GetTextByRow()
-		if err != nil {
-			continue
-		}
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pageNum := range pageChan {
+				func() {
+					defer func() {
+						_ = recover()
+					}()
 
-		var pageBuf strings.Builder
-		for _, row := range rows {
-			for _, word := range row.Content {
-				pageBuf.WriteString(word.S)
+					p := r.Page(pageNum)
+					if p.V.IsNull() {
+						return
+					}
+
+					rows, err := p.GetTextByRow()
+					var body string
+					if err == nil {
+						var pageBuf strings.Builder
+						for _, row := range rows {
+							for _, word := range row.Content {
+								pageBuf.WriteString(word.S)
+							}
+							pageBuf.WriteString("\n")
+						}
+						body = strings.TrimSpace(pageBuf.String())
+					}
+
+					if body == "" {
+						var fallbackBuf strings.Builder
+						for _, text := range p.Content().Text {
+							fallbackBuf.WriteString(text.S)
+						}
+						body = strings.TrimSpace(fallbackBuf.String())
+					}
+
+					if body == "" {
+						return
+					}
+
+					pageChapters[pageNum-1] = Chapter{
+						Title: fmt.Sprintf("Page %d", pageNum),
+						Body:  body,
+					}
+				}()
 			}
-			pageBuf.WriteString("\n")
-		}
+		}()
+	}
 
-		body := strings.TrimSpace(pageBuf.String())
-		if body == "" {
-			continue
-		}
+	wg.Wait()
 
-		chapters = append(chapters, Chapter{
-			Title: fmt.Sprintf("Page %d", i),
-			Body:  body,
-		})
+	var chapters []Chapter
+	for _, ch := range pageChapters {
+		if ch.Body != "" {
+			chapters = append(chapters, ch)
+		}
+	}
+
+	if len(chapters) == 0 {
+		pt, err := r.GetPlainText()
+		if err == nil {
+			var buf bytes.Buffer
+			_, _ = buf.ReadFrom(pt)
+			fullText := strings.TrimSpace(buf.String())
+			if fullText != "" {
+				chapters = append(chapters, Chapter{
+					Title: "Document",
+					Body:  fullText,
+				})
+			}
+		}
 	}
 
 	if len(chapters) == 0 {

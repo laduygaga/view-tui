@@ -2,6 +2,8 @@ module view-tui
 
 go 1.26.5
 
+replace github.com/dslipak/pdf => ./internal/pdf
+
 require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10

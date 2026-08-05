@@ -60,6 +60,22 @@ func TestReadPdf(t *testing.T) {
 	t.Logf("Successfully read PDF: %s. Total pages: %d", meta.Title, len(chapters))
 }
 
+func TestChienTranhTienTePDF(t *testing.T) {
+	pdfPath := "/home/duy/Documents/nhasachmienphi-chien-tranh-tien-te.pdf"
+	if _, err := os.Stat(pdfPath); os.IsNotExist(err) {
+		t.Skip("PDF file not found")
+	}
+
+	chapters, meta, err := readPdf(pdfPath)
+	if err != nil {
+		t.Fatalf("Failed to read pdf: %v", err)
+	}
+	t.Logf("Read %d pages, title: %s", len(chapters), meta.Title)
+	if len(chapters) > 1 {
+		t.Logf("Page 2 body:\n%s", chapters[1].Body)
+	}
+}
+
 func TestReadingPositionPersistence(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "view-tui-test-*")
 	if err != nil {
