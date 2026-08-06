@@ -739,31 +739,25 @@ func (v Value) Len() int {
 //	bugfix: in case the object-ref is within a stream than nothing was returned 
 //
 func (r *Reader) resolve(parent objptr, x interface{}) Value {
-
 	if ptr, ok := x.(objptr); ok {
 		if ptr.id >= uint32(len(r.xref)) {
 			return Value{}
 		}
 		xref := r.xref[ptr.id]
-		if xref.ptr != ptr || !xref.inStream && xref.offset == 0 {
-			return Value{}
-		}
-		// var obj object
 		if xref.inStream {
 			strm := r.resolve(parent, xref.stream)
-			
 		Search:
 			for {
 				if strm.Kind() != Stream {
-					panic("not a stream")
+					return Value{}
 				}
 				if strm.Key("Type").Name() != "ObjStm" {
-					panic("not an object stream")
+					return Value{}
 				}
 				n := int(strm.Key("N").Int64())
 				first := strm.Key("First").Int64()
 				if first == 0 {
-					panic("missing First")
+					return Value{}
 				}
 				b := newBuffer(strm.Reader(), 0)
 				b.allowEOF = true
@@ -771,7 +765,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 					id, _ := b.readToken().(int64)
 					off, _ := b.readToken().(int64)
 					if uint32(id) == ptr.id {
-						b.seekForward(first + off)
+						err := b.seekForward(first + off)
 						objinstream, err := b.readObject()
 						if err != nil {
 							return Value{}
@@ -782,7 +776,7 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 				}
 				ext := strm.Key("Extends")
 				if ext.Kind() != Stream {
-					panic("cannot find object in stream")
+					return Value{}
 				}
 				strm = ext
 			}
@@ -796,11 +790,10 @@ func (r *Reader) resolve(parent objptr, x interface{}) Value {
 			}
 			def, ok := obj.(objdef)
 			if !ok {
-				panic(fmt.Errorf("loading %v: found %T instead of objdef", ptr, obj))
-				//return Value{}
+				return Value{}
 			}
 			if def.ptr != ptr {
-				panic(fmt.Errorf("loading %v: found %v", ptr, def.ptr))
+				return Value{}
 			}
 			x = def.obj
 		}
@@ -839,8 +832,20 @@ func (v Value) Reader() io.ReadCloser {
 	if !ok {
 		return &errorReadCloser{fmt.Errorf("stream not present")}
 	}
+	length := v.Key("Length").Int64()
+	if length <= 0 {
+		if lObj, ok := x.hdr["Length"].(int64); ok {
+			length = lObj
+		}
+	}
+	if length <= 0 {
+		length = v.r.end - x.offset
+		if length < 0 {
+			length = 0
+		}
+	}
 	var rd io.Reader
-	rd = io.NewSectionReader(v.r.f, x.offset, v.Key("Length").Int64())
+	rd = io.NewSectionReader(v.r.f, x.offset, length)
 	if v.r.key != nil {
 		rd = decryptStream(v.r.key, v.r.useAES, x.ptr, rd)
 	}
@@ -875,13 +880,18 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		if pred.Kind() == Null {
 			return zr
 		}
-		columns := param.Key("Columns").Int64()
-		switch pred.Int64() {
+		columns := int(param.Key("Columns").Int64())
+		if columns <= 0 {
+			columns = 1
+		}
+		pVal := pred.Int64()
+		switch {
+		case pVal <= 1 || pVal == 10:
+			return zr
+		case pVal >= 11 && pVal <= 15:
+			return newPngPredictorReader(zr, columns)
 		default:
-			fmt.Println("unknown predictor", pred)
-			panic("pred")
-		case 12:
-			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+			return zr
 		}
 	case "ASCII85Decode":
 		cleanASCII85 := newAlphaReader(rd)
@@ -896,14 +906,51 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 	}
 }
 
-type pngUpReader struct {
-	r    io.Reader
-	hist []byte
-	tmp  []byte
-	pend []byte
+type pngPredictorReader struct {
+	r       io.Reader
+	columns int
+	bpp     int
+	hist    []byte
+	tmp     []byte
+	pend    []byte
 }
 
-func (r *pngUpReader) Read(b []byte) (int, error) {
+func newPngPredictorReader(r io.Reader, columns int) io.Reader {
+	if columns <= 0 {
+		columns = 1
+	}
+	return &pngPredictorReader{
+		r:       r,
+		columns: columns,
+		bpp:     1,
+		hist:    make([]byte, columns),
+		tmp:     make([]byte, 1+columns),
+	}
+}
+
+func absVal(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func paethPredictor(a, b, c byte) byte {
+	ia, ib, ic := int(a), int(b), int(c)
+	p := ia + ib - ic
+	pa := absVal(p - ia)
+	pb := absVal(p - ib)
+	pc := absVal(p - ic)
+	if pa <= pb && pa <= pc {
+		return a
+	}
+	if pb <= pc {
+		return b
+	}
+	return c
+}
+
+func (r *pngPredictorReader) Read(b []byte) (int, error) {
 	n := 0
 	for len(b) > 0 {
 		if len(r.pend) > 0 {
@@ -915,15 +962,51 @@ func (r *pngUpReader) Read(b []byte) (int, error) {
 		}
 		_, err := io.ReadFull(r.r, r.tmp)
 		if err != nil {
+			if n > 0 {
+				return n, nil
+			}
 			return n, err
 		}
-		if r.tmp[0] != 2 {
-			return n, fmt.Errorf("malformed PNG-Up encoding")
+		filter := r.tmp[0]
+		raw := r.tmp[1:]
+		row := make([]byte, r.columns)
+		switch filter {
+		case 0: // None
+			copy(row, raw)
+		case 1: // Sub
+			for i := 0; i < r.columns; i++ {
+				var left byte
+				if i >= r.bpp {
+					left = row[i-r.bpp]
+				}
+				row[i] = raw[i] + left
+			}
+		case 2: // Up
+			for i := 0; i < r.columns; i++ {
+				row[i] = raw[i] + r.hist[i]
+			}
+		case 3: // Average
+			for i := 0; i < r.columns; i++ {
+				var left byte
+				if i >= r.bpp {
+					left = row[i-r.bpp]
+				}
+				row[i] = raw[i] + byte((int(left)+int(r.hist[i]))/2)
+			}
+		case 4: // Paeth
+			for i := 0; i < r.columns; i++ {
+				var left, upperLeft byte
+				if i >= r.bpp {
+					left = row[i-r.bpp]
+					upperLeft = r.hist[i-r.bpp]
+				}
+				row[i] = raw[i] + paethPredictor(left, r.hist[i], upperLeft)
+			}
+		default:
+			copy(row, raw)
 		}
-		for i, b := range r.tmp {
-			r.hist[i] += b
-		}
-		r.pend = r.hist[1:]
+		r.hist = row
+		r.pend = row
 	}
 	return n, nil
 }
