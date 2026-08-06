@@ -496,6 +496,32 @@ func readPdf(filePath string) ([]Chapter, BookMetadata, error) {
 		return nil, meta, fmt.Errorf("no pages found in pdf")
 	}
 
+	sampleLimit := 10
+	if sampleLimit > numPages {
+		sampleLimit = numPages
+	}
+
+	hasAnyFontsOrText := false
+	for i := 1; i <= sampleLimit; i++ {
+		p := r.Page(i)
+		if p.V.IsNull() {
+			continue
+		}
+		if len(p.Fonts()) > 0 {
+			hasAnyFontsOrText = true
+			break
+		}
+		rows, err := p.GetTextByRow()
+		if err == nil && len(rows) > 0 {
+			hasAnyFontsOrText = true
+			break
+		}
+	}
+
+	if !hasAnyFontsOrText {
+		return nil, meta, fmt.Errorf("no readable text found in pdf (this file appears to be a scanned/image-only PDF without an embedded text layer)")
+	}
+
 	pageChapters := make([]Chapter, numPages)
 
 	numWorkers := runtime.NumCPU() * 2
@@ -587,7 +613,7 @@ func readPdf(filePath string) ([]Chapter, BookMetadata, error) {
 	}
 
 	if len(chapters) == 0 {
-		return nil, meta, fmt.Errorf("no readable text found in pdf")
+		return nil, meta, fmt.Errorf("no readable text found in pdf (this file appears to be a scanned/image-only PDF without an embedded text layer)")
 	}
 
 	return chapters, meta, nil

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReadEpub(t *testing.T) {
@@ -72,9 +73,24 @@ func TestQuyDinhUserDataPDF(t *testing.T) {
 	}
 
 	t.Logf("Read %d pages, title: %s", len(chapters), meta.Title)
-	for i, ch := range chapters {
-		t.Logf("--- Page %d (%s) ---:\n%s", i+1, ch.Title, ch.Body)
+	if len(chapters) > 0 {
+		t.Logf("Page 1 snippet:\n%s", chapters[0].Body[:min(200, len(chapters[0].Body))])
 	}
+}
+
+func TestPhanTichChungKhoanPDF(t *testing.T) {
+	pdfPath := "/home/duy/Documents/Phân Tích Chứng Khoán - Benjamin Graham & David L. Dodd.pdf"
+	if _, err := os.Stat(pdfPath); os.IsNotExist(err) {
+		t.Skip("PDF file not found")
+	}
+
+	start := time.Now()
+	_, _, err := readPdf(pdfPath)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("Expected error for scanned PDF, got nil")
+	}
+	t.Logf("Detected scanned PDF in %v with error: %v", elapsed, err)
 }
 
 func TestReadingPositionPersistence(t *testing.T) {
