@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -158,5 +159,87 @@ func TestTranslateToVietnamese(t *testing.T) {
 	}
 	if !strings.Contains(strings.ToLower(res), "chào") && !strings.Contains(strings.ToLower(res), "thế giới") {
 		t.Errorf("Expected Vietnamese translation, got: %s", res)
+	}
+}
+
+func TestDetectLanguage(t *testing.T) {
+	if lang := detectLanguage("Xin chào thế giới, đây là bài kiểm tra"); lang != "vi" {
+		t.Errorf("Expected 'vi', got %s", lang)
+	}
+	if lang := detectLanguage("Hello world, this is a simple test"); lang != "en" {
+		t.Errorf("Expected 'en', got %s", lang)
+	}
+	if lang := detectLanguage("Chapter 1: The Boy Who Lived. Mr. and Mrs. Dursley René Café"); lang != "en" {
+		t.Errorf("Expected 'en' for English with accented names, got %s", lang)
+	}
+}
+
+func TestSplitChunkIfNeeded(t *testing.T) {
+	longChunk := "This is a very long sentence that exceeds the maximum character limit for Google Translate TTS API query parameter."
+	subChunks := splitChunkIfNeeded(longChunk, 50)
+	for _, sc := range subChunks {
+		if len([]rune(sc)) > 50 {
+			t.Errorf("Subchunk exceeded limit: %q (%d runes)", sc, len([]rune(sc)))
+		}
+	}
+}
+
+func TestSplitTextForTTS(t *testing.T) {
+	sampleText := "Hello world. This is the first sentence. This is the second sentence!\nAnd a new paragraph here."
+	chunks := splitTextForTTS(sampleText, 50)
+	if len(chunks) == 0 {
+		t.Fatal("Expected non-empty chunks")
+	}
+	for _, chunk := range chunks {
+		if len(chunk) > 60 {
+			t.Errorf("Chunk exceeded expected limit: %q", chunk)
+		}
+	}
+}
+
+func TestModelTTSState(t *testing.T) {
+	m := model{
+		chapters: []Chapter{
+			{Title: "Ch 1", Body: "Sample chapter body text."},
+		},
+		currentChapterIndex: 0,
+	}
+
+	if m.isSpeaking {
+		t.Error("Expected initial isSpeaking to be false")
+	}
+
+	cmd := m.startTTSCmd()
+	if cmd == nil {
+		t.Fatal("Expected startTTSCmd to return tea.Cmd")
+	}
+	if !m.isSpeaking {
+		t.Error("Expected isSpeaking to be true after startTTSCmd")
+	}
+
+	m.stopTTS()
+	if m.isSpeaking {
+		t.Error("Expected isSpeaking to be false after stopTTS")
+	}
+}
+
+func TestSpeakTextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	err := speakText(ctx, "Hello world", 1.35)
+	if err != nil {
+		t.Errorf("Expected nil error on cancelled context, got: %v", err)
+	}
+}
+
+func TestTTSSpeedAdjustment(t *testing.T) {
+	m := model{}
+	if speed := m.getTTSSpeed(); speed != 1.35 {
+		t.Errorf("Expected default speed 1.35, got %.2f", speed)
+	}
+
+	m.ttsSpeed = 1.5
+	if speed := m.getTTSSpeed(); speed != 1.5 {
+		t.Errorf("Expected speed 1.5, got %.2f", speed)
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -214,6 +216,12 @@ type model struct {
 	translating         bool
 	translatedChapters  map[int]string
 	translationError    string
+
+	isSpeaking          bool
+	ttsCancel           context.CancelFunc
+	ttsError            string
+	ttsSpeed            float64
+	ttsSessionID        int64
 }
 
 func (m *model) saveCurrentPosition() {
@@ -421,6 +429,390 @@ func parseGoogleTranslateResponse(data []byte) (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+type ttsFinishedMsg struct {
+	sessionID int64
+	err       error
+}
+
+func (m *model) stopTTS() {
+	m.ttsSessionID++
+	if m.ttsCancel != nil {
+		m.ttsCancel()
+		m.ttsCancel = nil
+	}
+	m.isSpeaking = false
+}
+
+func (m *model) getTTSSpeed() float64 {
+	if m.ttsSpeed <= 0.1 {
+		return 1.35
+	}
+	return m.ttsSpeed
+}
+
+func (m *model) startTTSCmd() tea.Cmd {
+	m.stopTTS()
+
+	text := m.getChapterBody()
+	if strings.TrimSpace(text) == "" {
+		m.ttsError = "No text to read"
+		return nil
+	}
+
+	sessionID := m.ttsSessionID
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.ttsCancel = cancel
+	m.isSpeaking = true
+	m.ttsError = ""
+
+	speed := m.getTTSSpeed()
+
+	return func() tea.Msg {
+		err := speakText(ctx, text, speed)
+		return ttsFinishedMsg{
+			sessionID: sessionID,
+			err:       err,
+		}
+	}
+}
+
+func detectLanguage(text string) string {
+	vietnameseUniqueChars := "đđơớờởỡợưứừửữựăắằẳẵặảẳẩẻểỉỏổởủửỷãẵẫẽễĩõỗỡũữỹạặậẹệịọộợụựỵốồổỗộếềểễệấầẩẫậ"
+	count := 0
+	for _, r := range strings.ToLower(text) {
+		if strings.ContainsRune(vietnameseUniqueChars, r) {
+			count++
+		}
+	}
+	if count >= 3 {
+		return "vi"
+	}
+	return "en"
+}
+
+func speakText(ctx context.Context, text string, speed float64) error {
+	docLang := detectLanguage(text)
+
+	chunks := splitTextForTTS(text, 120)
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	for i, chunk := range chunks {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		chunk = strings.TrimSpace(chunk)
+		if chunk == "" {
+			continue
+		}
+
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(150 * time.Millisecond):
+			}
+		}
+
+		chunkLang := docLang
+		if docLang == "en" {
+			if detectLanguage(chunk) == "vi" {
+				chunkLang = "vi"
+			}
+		}
+
+		err := speakChunk(ctx, chunk, chunkLang, speed)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitTextForTTS(text string, maxLen int) []string {
+	paragraphs := strings.Split(text, "\n")
+	var chunks []string
+
+	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+
+		runes := []rune(p)
+		if len(runes) <= maxLen {
+			chunks = append(chunks, p)
+			continue
+		}
+
+		var current []rune
+		lastBreak := -1
+
+		for _, r := range runes {
+			current = append(current, r)
+
+			if r == '.' || r == '!' || r == '?' || r == ';' || r == ',' || r == ' ' {
+				lastBreak = len(current)
+			}
+
+			if len(current) >= maxLen {
+				if lastBreak > 0 {
+					chunkStr := strings.TrimSpace(string(current[:lastBreak]))
+					if chunkStr != "" {
+						chunks = append(chunks, chunkStr)
+					}
+					current = current[lastBreak:]
+					lastBreak = -1
+				} else {
+					chunkStr := strings.TrimSpace(string(current))
+					if chunkStr != "" {
+						chunks = append(chunks, chunkStr)
+					}
+					current = nil
+					lastBreak = -1
+				}
+			}
+		}
+
+		if len(current) > 0 {
+			chunkStr := strings.TrimSpace(string(current))
+			if chunkStr != "" {
+				chunks = append(chunks, chunkStr)
+			}
+		}
+	}
+
+	return chunks
+}
+
+func splitChunkIfNeeded(chunk string, maxRunes int) []string {
+	runes := []rune(chunk)
+	if len(runes) <= maxRunes {
+		return []string{chunk}
+	}
+
+	var parts []string
+	for len(runes) > 0 {
+		if len(runes) <= maxRunes {
+			parts = append(parts, string(runes))
+			break
+		}
+
+		cut := maxRunes
+		for i := maxRunes; i > 0; i-- {
+			r := runes[i-1]
+			if r == ' ' || r == '.' || r == ',' || r == '!' || r == '?' || r == ';' {
+				cut = i
+				break
+			}
+		}
+
+		part := strings.TrimSpace(string(runes[:cut]))
+		if part != "" {
+			parts = append(parts, part)
+		}
+		runes = runes[cut:]
+	}
+	return parts
+}
+
+func speakChunk(ctx context.Context, chunk string, lang string, speed float64) error {
+	if speed <= 0.1 {
+		speed = 1.35
+	}
+
+	subChunks := splitChunkIfNeeded(chunk, 140)
+	if len(subChunks) > 1 {
+		for i, sc := range subChunks {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+			if i > 0 {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			err := speakChunk(ctx, sc, lang, speed)
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	ttsURL := fmt.Sprintf("https://translate.google.com/translate_tts?ie=UTF-8&tl=%s&client=tw-ob&q=%s", lang, url.QueryEscape(chunk))
+
+	var mp3Downloaded bool
+	var tmpPath string
+
+	tmpFile, err := os.CreateTemp("", "tts-*.mp3")
+	if err == nil {
+		tmpPath = tmpFile.Name()
+		tmpFile.Close()
+		defer os.Remove(tmpPath)
+
+		for attempt := 0; attempt < 3; attempt++ {
+			if ctx.Err() != nil {
+				return nil
+			}
+
+			req, err := http.NewRequestWithContext(ctx, "GET", ttsURL, nil)
+			if err != nil {
+				break
+			}
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				if resp.StatusCode == http.StatusOK {
+					out, err := os.Create(tmpPath)
+					if err == nil {
+						_, err = io.Copy(out, resp.Body)
+						out.Close()
+						resp.Body.Close()
+
+						if err == nil {
+							mp3Downloaded = true
+							break
+						}
+					} else {
+						resp.Body.Close()
+					}
+				} else {
+					resp.Body.Close()
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Duration(200*(attempt+1)) * time.Millisecond):
+			}
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	if mp3Downloaded {
+		played := playAudioFile(ctx, tmpPath, speed)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if played {
+			return nil
+		}
+	}
+
+	return speakOffline(ctx, chunk, lang, speed)
+}
+
+func playAudioFile(ctx context.Context, filePath string, speed float64) bool {
+	players := []string{"mpv", "ffplay", "afplay", "paplay", "aplay"}
+	for _, p := range players {
+		path, err := exec.LookPath(p)
+		if err != nil {
+			continue
+		}
+
+		var cmd *exec.Cmd
+		if strings.HasSuffix(path, "mpv") {
+			cmd = exec.CommandContext(ctx, path, "--no-video", "--no-terminal", fmt.Sprintf("--speed=%.2f", speed), filePath)
+		} else if strings.HasSuffix(path, "ffplay") {
+			cmd = exec.CommandContext(ctx, path, "-nodisp", "-autoexit", "-loglevel", "quiet", "-af", fmt.Sprintf("atempo=%.2f", speed), filePath)
+		} else {
+			cmd = exec.CommandContext(ctx, path, filePath)
+		}
+
+		err = cmd.Run()
+		if ctx.Err() != nil {
+			return true
+		}
+		if err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func speakOffline(ctx context.Context, chunk string, lang string, speed float64) error {
+	wpm := int(175.0 * speed)
+	switch runtime.GOOS {
+	case "darwin":
+		if path, err := exec.LookPath("say"); err == nil {
+			cmd := exec.CommandContext(ctx, path, "-r", strconv.Itoa(wpm), chunk)
+			err := cmd.Run()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	case "linux":
+		if path, err := exec.LookPath("espeak-ng"); err == nil {
+			cmd := exec.CommandContext(ctx, path, "-s", strconv.Itoa(wpm), "-v", lang, chunk)
+			err := cmd.Run()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if path, err := exec.LookPath("espeak"); err == nil {
+			cmd := exec.CommandContext(ctx, path, "-s", strconv.Itoa(wpm), "-v", lang, chunk)
+			err := cmd.Run()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if path, err := exec.LookPath("spd-say"); err == nil {
+			rate := int((speed - 1.0) * 50)
+			cmd := exec.CommandContext(ctx, path, "-r", strconv.Itoa(rate), "-l", lang, "-w", chunk)
+			err := cmd.Run()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	case "windows":
+		if path, err := exec.LookPath("powershell"); err == nil {
+			escaped := strings.ReplaceAll(chunk, "'", "''")
+			escaped = strings.ReplaceAll(escaped, `"`, `""`)
+			rate := int((speed - 1.0) * 5)
+			if rate < -10 {
+				rate = -10
+			}
+			if rate > 10 {
+				rate = 10
+			}
+			psScript := fmt.Sprintf(`Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = %d; $s.Speak('%s')`, rate, escaped)
+			cmd := exec.CommandContext(ctx, path, "-NoProfile", "-NonInteractive", "-Command", psScript)
+			err := cmd.Run()
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
+
+	return fmt.Errorf("no TTS engine found (install mpv, ffplay, or espeak-ng)")
 }
 
 func readEpub(filePath string) ([]Chapter, BookMetadata, error) {
@@ -741,6 +1133,8 @@ func (m *model) loadBook(filePath string) error {
 	m.translating = false
 	m.translatedChapters = make(map[int]string)
 	m.translationError = ""
+	m.stopTTS()
+	m.ttsError = ""
 
 	headerHeight := 4
 	footerHeight := 4
@@ -992,6 +1386,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case ttsFinishedMsg:
+		if msg.sessionID != m.ttsSessionID {
+			return m, nil
+		}
+		m.isSpeaking = false
+		m.ttsCancel = nil
+		if msg.err != nil {
+			m.ttsError = fmt.Sprintf("TTS error: %v", msg.err)
+		} else {
+			m.ttsError = ""
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		switch m.mode {
 		case modeFilePicker:
@@ -1077,10 +1484,12 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch keyStr {
 	case "ctrl+c":
+		m.stopTTS()
 		m.saveCurrentPosition()
 		return m, tea.Quit
 
 	case "q":
+		m.stopTTS()
 		m.saveCurrentPosition()
 		if m.showHelp {
 			m.showHelp = false
@@ -1121,6 +1530,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "left", "h", "p":
 		if m.currentChapterIndex > 0 {
+			m.stopTTS()
 			m.currentChapterIndex--
 			m.searchQuery = ""
 			m.searchMatches = nil
@@ -1139,6 +1549,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "right", "l", "space":
 		if m.currentChapterIndex < len(m.chapters)-1 {
+			m.stopTTS()
 			m.currentChapterIndex++
 			m.searchQuery = ""
 			m.searchMatches = nil
@@ -1156,6 +1567,7 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "t":
+		m.stopTTS()
 		if m.showingTranslation {
 			m.showingTranslation = false
 			m.translationError = ""
@@ -1170,6 +1582,35 @@ func (m model) updateReader(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.translationError = ""
 				return m, translateChapterCmd(m.currentChapterIndex, m.chapters[m.currentChapterIndex].Body)
 			}
+		}
+
+	case "s":
+		if m.isSpeaking {
+			m.stopTTS()
+			m.ttsError = ""
+		} else {
+			cmd := m.startTTSCmd()
+			return m, cmd
+		}
+
+	case "+", "]", ">":
+		speed := m.getTTSSpeed() + 0.15
+		if speed > 3.0 {
+			speed = 3.0
+		}
+		m.ttsSpeed = speed
+		if m.isSpeaking {
+			return m, m.startTTSCmd()
+		}
+
+	case "-", "[", "<":
+		speed := m.getTTSSpeed() - 0.15
+		if speed < 0.5 {
+			speed = 0.5
+		}
+		m.ttsSpeed = speed
+		if m.isSpeaking {
+			return m, m.startTTSCmd()
 		}
 
 	case "n", "ctrl+n":
@@ -1371,6 +1812,16 @@ func (m model) viewReader() string {
 			translateStatus = " | [t: Translate to VN]"
 		}
 
+		var ttsStatus string
+		speedStr := fmt.Sprintf("%.2fx", m.getTTSSpeed())
+		if m.isSpeaking {
+			ttsStatus = fmt.Sprintf(" | 🔊 Speaking (%s)... [s: Stop, +/-: Speed]", speedStr)
+		} else if m.ttsError != "" {
+			ttsStatus = fmt.Sprintf(" | %s", styleError.Render(m.ttsError))
+		} else {
+			ttsStatus = fmt.Sprintf(" | [s: Speak (%s)]", speedStr)
+		}
+
 		var searchText string
 		if m.searchQuery != "" {
 			matchIndexText := "no matches"
@@ -1380,7 +1831,7 @@ func (m model) viewReader() string {
 			searchText = fmt.Sprintf(" | Search: \"%s\" (%s, n/N)", m.searchQuery, matchIndexText)
 		}
 
-		s.WriteString(styleFooter.Render(fmt.Sprintf("%s%s%s  •  [? / u: Help]", progressText, translateStatus, searchText)))
+		s.WriteString(styleFooter.Render(fmt.Sprintf("%s%s%s%s  •  [? / u: Help]", progressText, translateStatus, ttsStatus, searchText)))
 	}
 
 	return s.String()
@@ -1401,6 +1852,8 @@ func (m model) viewHelp() string {
 		{"l, Right, Space", "Next Chapter / Page"},
 		{"h, Left, p", "Previous Chapter / Page"},
 		{"t", "Toggle Vietnamese translation"},
+		{"s", "Toggle Text-to-Speech (read aloud)"},
+		{"+ / - or ] / [", "Increase / decrease speech speed"},
 		{"/", "Search within chapter"},
 		{"n", "Next search match"},
 		{"N", "Previous search match"},
